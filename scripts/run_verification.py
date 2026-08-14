@@ -52,11 +52,12 @@ class DMCountVGG19(nn.Module):
 
     def __init__(self):
         super().__init__()
-        vgg = tv_models.vgg19_bn(weights=None)
+        vgg = tv_models.vgg19(weights=None)  # DM-Count checkpoints use plain VGG19, no batch-norm
         features = list(vgg.features.children())
-        # Stop after the 4th max-pool block -> stride 8 feature map (matches
-        # DM-Count's stated stride-8 output).
-        self.features = nn.Sequential(*features[:-10])
+        # Stop after the 4th max-pool block (index 27 in non-BN vgg19) -> stride 8 feature map
+        # (matches DM-Count's stated stride-8 output). Confirmed against checkpoint's
+        # features.7/.10/.14/.21 conv shapes, which only align with the non-BN VGG19 indexing.
+        self.features = nn.Sequential(*features[:27])
         self.reg_layer = nn.Sequential(
             nn.Conv2d(512, 256, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
@@ -98,6 +99,15 @@ class DMCountPredictor:
         std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
         rgb = (rgb - mean) / std
         h, w = rgb.shape[:2]
+        # UCF-QNRF's own preprocessing caps the longest side at 2048px; also keeps
+        # inference under 4GB VRAM on the GTX 1650.
+        max_side = 2048
+        longest = max(h, w)
+        if longest > max_side:
+            scale = max_side / longest
+            new_h, new_w = int(round(h * scale)), int(round(w * scale))
+            rgb = cv2.resize(rgb, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            h, w = new_h, new_w
         # Pad to a multiple of 32 for clean pooling.
         ph, pw = ((h + 31) // 32) * 32, ((w + 31) // 32) * 32
         canvas = np.zeros((ph, pw, 3), dtype=np.float32)
