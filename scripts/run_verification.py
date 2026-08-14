@@ -1,6 +1,6 @@
-"""Independent verification: run DM-Count (SH-A, QNRF) and APGCC (SH-A) on your
-own test images and see the real predicted counts — before approving any of
-them for production.
+"""Independent verification: run DM-Count (SH-A, QNRF), APGCC (SH-A), and
+CLIP-EBC (SH-A, QNRF) on your own test images and see the real predicted
+counts — before approving any of them for production.
 
 This does NOT trust the junior's reported MAE/bias numbers. It runs the actual
 checkpoints on actual images and shows you the actual output, so you can
@@ -27,6 +27,7 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "apgcc_kit"))
+sys.path.insert(0, os.path.join(ROOT, "tmp_clipebc"))
 
 import cv2
 import numpy as np
@@ -116,6 +117,80 @@ def load_apgcc_predictor(weights_path: str, device: str, conf: float, max_long_s
 
 
 # --------------------------------------------------------------------------
+# CLIP-EBC: uses tmp_clipebc's own get_model() + bins/anchor_points from
+# tmp_clipebc/configs/reduction_8.json. Hyperparameters match the README's
+# documented ViT-B/16 recipe (input_size=224, reduction=8, truncation=4,
+# prompt_type="word", granularity="fine", anchor_points="average", deep VPT).
+# Same recipe for both SH-A and QNRF checkpoints — only the --dataset config
+# lookup key ("sha" vs "qnrf") differs.
+# --------------------------------------------------------------------------
+CLIPEBC_INPUT_SIZE = 224
+CLIPEBC_REDUCTION = 8
+CLIPEBC_TRUNCATION = "4"
+CLIPEBC_NUM_VPT = 32
+CLIPEBC_VPT_DROP = 0.0
+CLIPEBC_DEEP_VPT = True
+
+
+def _load_clipebc_bins(dataset_key: str):
+    import json
+    cfg_path = os.path.join(ROOT, "tmp_clipebc", "configs", f"reduction_{CLIPEBC_REDUCTION}.json")
+    with open(cfg_path, "r") as f:
+        cfg = json.load(f)[CLIPEBC_TRUNCATION][dataset_key]
+    bins = [(float(b[0]), float("inf") if b[1] == "inf" else float(b[1])) for b in cfg["bins"]["fine"]]
+    anchor_points = [float(p) for p in cfg["anchor_points"]["fine"]["average"]]
+    return bins, anchor_points
+
+
+class ClipEBCPredictor:
+    """Loads a CLIP-EBC (ViT-B/16) checkpoint and predicts a head count for a
+    BGR frame. Outputs a density map, same interface shape as DMCountPredictor.
+    """
+
+    def __init__(self, weights_path: str, dataset_key: str, device: str = "cpu"):
+        from models import get_model  # tmp_clipebc/models/__init__.py
+
+        self.device = device
+        bins, anchor_points = _load_clipebc_bins(dataset_key)
+
+        self.model = get_model(
+            backbone="clip_vit_b_16",
+            input_size=CLIPEBC_INPUT_SIZE,
+            reduction=CLIPEBC_REDUCTION,
+            bins=bins,
+            anchor_points=anchor_points,
+            prompt_type="word",
+            num_vpt=CLIPEBC_NUM_VPT,
+            vpt_drop=CLIPEBC_VPT_DROP,
+            deep_vpt=CLIPEBC_DEEP_VPT,
+        ).to(device).eval()
+
+        state = torch.load(weights_path, map_location="cpu")
+        # best_mae.pth / best_rmse.pth checkpoints are raw state_dicts (no
+        # "model_state_dict" wrapper) — see tmp_clipebc/test_nwpu.py.
+        if isinstance(state, dict) and "model_state_dict" in state and "best" not in os.path.basename(weights_path):
+            state = state["model_state_dict"]
+        missing, unexpected = self.model.load_state_dict(state, strict=False)
+        if missing or unexpected:
+            print(f"  [!] CLIP-EBC partial load from {os.path.basename(weights_path)}: "
+                  f"{len(missing)} missing, {len(unexpected)} unexpected keys — "
+                  f"check hyperparameters (input_size/reduction/truncation) match training.")
+
+    @torch.no_grad()
+    def predict(self, frame_bgr: np.ndarray):
+        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+        # CLIP normalization (OpenAI CLIP mean/std), not ImageNet.
+        mean = np.array([0.48145466, 0.4578275, 0.40821073], dtype=np.float32)
+        std = np.array([0.26862954, 0.26130258, 0.27577711], dtype=np.float32)
+        resized = cv2.resize(rgb, (CLIPEBC_INPUT_SIZE, CLIPEBC_INPUT_SIZE), interpolation=cv2.INTER_LINEAR)
+        normed = (resized - mean) / std
+        tensor = torch.from_numpy(normed).permute(2, 0, 1).unsqueeze(0).to(self.device)
+        density = self.model(tensor)[0, 0].cpu().numpy()
+        count = float(density.sum())
+        return density, count
+
+
+# --------------------------------------------------------------------------
 # Shared helpers
 # --------------------------------------------------------------------------
 def find_images(images_dir: str) -> list[str]:
@@ -162,8 +237,8 @@ def main():
     ap.add_argument("--images_dir", default=os.path.join(ROOT, "data", "images"))
     ap.add_argument("--results_dir", default=os.path.join(ROOT, "results"))
     ap.add_argument("--models", nargs="+",
-                    default=["dmcount_sha", "dmcount_qnrf", "apgcc"],
-                    choices=["dmcount_sha", "dmcount_qnrf", "apgcc"],
+                    default=["dmcount_sha", "dmcount_qnrf", "apgcc", "clipebc_sha", "clipebc_qnrf"],
+                    choices=["dmcount_sha", "dmcount_qnrf", "apgcc", "clipebc_sha", "clipebc_qnrf"],
                     help="Which models to run.")
     ap.add_argument("--device", default="cpu", help="cpu or cuda")
 
@@ -177,6 +252,12 @@ def main():
     ap.add_argument("--apgcc_max_long_side", type=int, default=1280,
                     help="Accuracy knob, not a speed knob — see apgcc_infer.py docstring. "
                          "1280 suits 1-2MP CCTV; for 4K, lower this or tile instead.")
+    ap.add_argument("--clipebc_sha_weights",
+                    default=os.path.join(ROOT, "apgcc_kit", "weights",
+                                         "ShanghaiTech_A_CLIP_EBC_ViT_B_16_Word", "best_mae.pth"))
+    ap.add_argument("--clipebc_qnrf_weights",
+                    default=os.path.join(ROOT, "apgcc_kit", "weights",
+                                         "UCF_QNRF_CLIP_EBC_ViT_B_16_Word", "best_mae.pth"))
 
     args = ap.parse_args()
 
@@ -220,6 +301,28 @@ def main():
         else:
             print(f"[!] Skipping APGCC: not found at {args.apgcc_weights}")
 
+    if "clipebc_sha" in args.models:
+        if os.path.exists(args.clipebc_sha_weights):
+            try:
+                predictors["clipebc_sha"] = ("CLIP-EBC SH-A",
+                                             ClipEBCPredictor(args.clipebc_sha_weights, "sha", args.device))
+                print(f"[ok] CLIP-EBC SH-A -> {args.clipebc_sha_weights}")
+            except Exception as e:
+                print(f"[!] Failed to load CLIP-EBC SH-A: {e}")
+        else:
+            print(f"[!] Skipping CLIP-EBC SH-A: not found at {args.clipebc_sha_weights}")
+
+    if "clipebc_qnrf" in args.models:
+        if os.path.exists(args.clipebc_qnrf_weights):
+            try:
+                predictors["clipebc_qnrf"] = ("CLIP-EBC QNRF",
+                                              ClipEBCPredictor(args.clipebc_qnrf_weights, "qnrf", args.device))
+                print(f"[ok] CLIP-EBC QNRF -> {args.clipebc_qnrf_weights}")
+            except Exception as e:
+                print(f"[!] Failed to load CLIP-EBC QNRF: {e}")
+        else:
+            print(f"[!] Skipping CLIP-EBC QNRF: not found at {args.clipebc_qnrf_weights}")
+
     if not predictors:
         raise RuntimeError("No models loaded — check weight paths above.")
 
@@ -234,7 +337,7 @@ def main():
         print(f"{os.path.basename(img_path)}  ({frame.shape[1]}x{frame.shape[0]})")
 
         for key, (label, predictor) in predictors.items():
-            if key.startswith("dmcount"):
+            if key.startswith("dmcount") or key.startswith("clipebc"):
                 density, count = predictor.predict(frame)
                 overlay = draw_count_only_overlay(frame, count, label)
                 heat = density_heatmap(density)
