@@ -1,6 +1,6 @@
-"""Independent verification: run DM-Count (SH-A, QNRF), APGCC (SH-A), and
-CLIP-EBC (SH-A, QNRF) on your own test images and see the real predicted
-counts — before approving any of them for production.
+"""Independent verification: run DM-Count (SH-A, QNRF) and APGCC (SH-A) on your
+own test images and see the real predicted counts — before approving any of
+them for production.
 
 This does NOT trust the junior's reported MAE/bias numbers. It runs the actual
 checkpoints on actual images and shows you the actual output, so you can
@@ -35,6 +35,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.models as tv_models
+from scipy import ndimage
 
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 
@@ -202,34 +203,89 @@ def find_images(images_dir: str) -> list[str]:
     return paths
 
 
-def density_heatmap(dm: np.ndarray) -> np.ndarray:
-    d = dm.copy()
-    if d.max() > 0:
-        d = d / d.max()
-    d8 = (d * 255.0).clip(0, 255).astype(np.uint8)
-    return cv2.applyColorMap(d8, cv2.COLORMAP_JET)
+def find_density_peaks(density_map: np.ndarray, min_distance: int = 4,
+                        threshold_rel: float = 0.05) -> np.ndarray:
+    """Approximate head locations from a density map via local-maxima peak
+    finding. This is NOT how the model was trained to be read — density
+    models are only trained to make density.sum() match the true count, not
+    to have individually meaningful peaks. Peak count will NOT equal the
+    model's reported total; it's a visual approximation of "where" only, for
+    side-by-side comparison against APGCC's real point detections.
+    """
+    if density_map.max() <= 0:
+        return np.zeros((0, 2), dtype=np.float32)
+    max_filt = ndimage.maximum_filter(density_map, size=min_distance)
+    peak_mask = (density_map == max_filt) & (density_map > density_map.max() * threshold_rel)
+    ys, xs = np.where(peak_mask)
+    return np.stack([xs, ys], axis=1).astype(np.float32) if len(xs) else np.zeros((0, 2), dtype=np.float32)
 
 
-def draw_points_overlay(frame: np.ndarray, points: np.ndarray, count: float, label: str) -> np.ndarray:
+def scale_points_to_frame(points: np.ndarray, map_hw: tuple, frame_hw: tuple) -> np.ndarray:
+    """Density-map peaks are in downsampled map coordinates; scale to the
+    original frame size so dots land on actual heads.
+    """
+    if len(points) == 0:
+        return points
+    mh, mw = map_hw
+    fh, fw = frame_hw
+    scaled = points.copy()
+    scaled[:, 0] *= fw / mw
+    scaled[:, 1] *= fh / mh
+    return scaled
+
+
+def draw_dot_panel(frame: np.ndarray, points: np.ndarray, count: float, label: str,
+                    dot_color=(0, 0, 255)) -> np.ndarray:
+    """Draw small colored dots on detected/peak head locations, plus a title
+    bar with the model name and its real total predicted count.
+    """
     out = frame.copy()
     for x, y in points:
-        cv2.circle(out, (int(round(x)), int(round(y))), 4, (0, 0, 255), -1)
-    text = f"{label}: {count:.1f} heads"
-    (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 1.1, 3)
-    cv2.rectangle(out, (10, 10), (20 + tw, 40 + th), (0, 0, 0), -1)
-    cv2.putText(out, text, (15, 35 + th // 2), cv2.FONT_HERSHEY_SIMPLEX,
-                1.1, (0, 255, 0), 3, cv2.LINE_AA)
-    return out
-
-
-def draw_count_only_overlay(frame: np.ndarray, count: float, label: str) -> np.ndarray:
-    out = frame.copy()
-    text = f"{label}: {count:.1f} heads (density-map model, no point locations)"
-    (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.9, 2)
+        cv2.circle(out, (int(round(x)), int(round(y))), 3, dot_color, -1)
+        cv2.circle(out, (int(round(x)), int(round(y))), 3, (255, 255, 255), 1)
+    title = f"{label}  ({count:.0f} heads)"
+    (tw, th), _ = cv2.getTextSize(title, cv2.FONT_HERSHEY_SIMPLEX, 0.9, 2)
     cv2.rectangle(out, (10, 10), (20 + tw, 38 + th), (0, 0, 0), -1)
-    cv2.putText(out, text, (15, 32 + th // 2), cv2.FONT_HERSHEY_SIMPLEX,
+    cv2.putText(out, title, (15, 32 + th // 2), cv2.FONT_HERSHEY_SIMPLEX,
                 0.9, (0, 255, 0), 2, cv2.LINE_AA)
     return out
+
+
+def build_comparison_grid(panels: list, source_name: str, cols: int = 3,
+                           panel_max_w: int = 640, pad: int = 16,
+                           header_h: int = 60) -> np.ndarray:
+    """Composite labeled per-model panels into one white-background grid
+    image, N columns per row, with a header showing the source image name.
+    `panels` is a list of (label, count, image) tuples.
+    """
+    n = len(panels)
+    rows = (n + cols - 1) // cols
+
+    # Resize every panel to a common width, preserving aspect ratio.
+    resized = []
+    for label, count, img in panels:
+        h, w = img.shape[:2]
+        scale = panel_max_w / w
+        new_h = int(round(h * scale))
+        resized.append(cv2.resize(img, (panel_max_w, new_h), interpolation=cv2.INTER_AREA))
+    panel_h = max(im.shape[0] for im in resized)
+
+    grid_w = cols * panel_max_w + (cols + 1) * pad
+    grid_h = header_h + rows * panel_h + (rows + 1) * pad
+    canvas = np.full((grid_h, grid_w, 3), 255, dtype=np.uint8)
+
+    header_text = f"{source_name} - model comparison"
+    cv2.putText(canvas, header_text, (pad, header_h - 20), cv2.FONT_HERSHEY_SIMPLEX,
+                1.0, (0, 0, 0), 2, cv2.LINE_AA)
+
+    for idx, im in enumerate(resized):
+        r, c = divmod(idx, cols)
+        y0 = header_h + pad + r * (panel_h + pad)
+        x0 = pad + c * (panel_max_w + pad)
+        h, w = im.shape[:2]
+        canvas[y0:y0 + h, x0:x0 + w] = im
+
+    return canvas
 
 
 def main():
@@ -334,29 +390,32 @@ def main():
             print(f"[!] Could not read: {img_path}")
             continue
         stem = os.path.splitext(os.path.basename(img_path))[0]
-        print(f"{os.path.basename(img_path)}  ({frame.shape[1]}x{frame.shape[0]})")
+        frame_h, frame_w = frame.shape[:2]
+        print(f"{os.path.basename(img_path)}  ({frame_w}x{frame_h})")
+
+        panels = []  # (label, count, panel_image) for the comparison grid
 
         for key, (label, predictor) in predictors.items():
             if key.startswith("dmcount") or key.startswith("clipebc"):
                 density, count = predictor.predict(frame)
-                overlay = draw_count_only_overlay(frame, count, label)
-                heat = density_heatmap(density)
-                heat_path = os.path.join(args.results_dir, f"{stem}_{key}_density.png")
-                cv2.imwrite(heat_path, heat)
-                n_points = None
-            else:  # apgcc — points, not density
+                map_h, map_w = density.shape[:2]
+                peaks = find_density_peaks(density)
+                points = scale_points_to_frame(peaks, (map_h, map_w), (frame_h, frame_w))
+                n_points = None  # peak count deliberately not reported — see find_density_peaks docstring
+            else:  # apgcc — real point detections
                 pts_scores = predictor(frame)  # (N, 3): x, y, score
                 points = pts_scores[:, :2] if len(pts_scores) else np.zeros((0, 2))
                 count = float(len(points))
-                overlay = draw_points_overlay(frame, points, count, label)
-                heat_path = ""
                 n_points = int(count)
 
+            panel = draw_dot_panel(frame, points, count, label)
+            panels.append((label, count, panel))
+
             overlay_path = os.path.join(args.results_dir, f"{stem}_{key}_overlay.jpg")
-            cv2.imwrite(overlay_path, overlay)
+            cv2.imwrite(overlay_path, panel)
 
             print(f"  {label:16s} count={count:8.2f}"
-                  + (f"  points={n_points}" if n_points is not None else "")
+                  + (f"  points={n_points}" if n_points is not None else "  (dots are approximate peaks, not the count)")
                   + f"  -> {os.path.basename(overlay_path)}")
 
             rows.append({
@@ -364,8 +423,12 @@ def main():
                 "model": label,
                 "predicted_count": round(count, 2),
                 "overlay_file": os.path.basename(overlay_path),
-                "density_file": os.path.basename(heat_path) if heat_path else "",
             })
+
+        grid = build_comparison_grid(panels, os.path.basename(img_path))
+        grid_path = os.path.join(args.results_dir, f"{stem}_comparison_grid.png")
+        cv2.imwrite(grid_path, grid)
+        print(f"  [grid] -> {os.path.basename(grid_path)}")
         print()
 
     csv_path = os.path.join(args.results_dir, "verification_summary.csv")
@@ -374,7 +437,7 @@ def main():
         writer.writeheader()
         writer.writerows(rows)
     print(f"Summary CSV: {csv_path}")
-    print(f"Overlays and density maps: {args.results_dir}")
+    print(f"Overlays and comparison grids: {args.results_dir}")
     print("\nNext: compare predicted_count against a manual head count on each "
           "image before trusting these models for production.")
 
