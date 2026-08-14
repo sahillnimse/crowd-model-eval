@@ -1,0 +1,23 @@
+# Combined requirements — DM-Count, APGCC, CLIP-EBC
+# Install torch for YOUR CUDA version first, e.g. cu126:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+
+torch>=2.2
+torchvision>=0.17
+opencv-python>=4.9
+numpy>=1.26
+pillow>=10.0
+
+# APGCC
+easydict>=1.10      # APGCC's config uses it
+scipy>=1.10         # Hungarian matcher in APGCC training
+tensorboardX>=2.6   # APGCC imports it at module load
+
+# CLIP-EBC
+timm>=0.9            # shared with APGCC backbones, version relaxed from ==0.9.16
+einops>=0.7
+ftfy>=6.1
+regex>=2023.12
+tqdm>=4.66
+
+# NOTE: NOT ultralytics — this kit is deliberately AGPL-free.

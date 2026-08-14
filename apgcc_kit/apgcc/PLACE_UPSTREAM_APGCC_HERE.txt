@@ -1,0 +1,7 @@
+Vendor the upstream APGCC source here:
+  git clone --depth 1 https://github.com/AaronCIH/APGCC.git tmp_apgcc
+  cp -r tmp_apgcc/apgcc/* apgcc_kit/apgcc/
+  cp tmp_apgcc/LICENSE apgcc_kit/apgcc/LICENSE
+
+This folder must contain the upstream 'models/', 'configs/', 'util/' etc.
+apgcc_loader.py expects this exact layout (see VENDOR_DIR in apgcc_loader.py).

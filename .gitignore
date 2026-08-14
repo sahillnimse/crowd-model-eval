@@ -1,0 +1,64 @@
+# ==== Virtual environment ====
+venv/
+env/
+.venv/
+
+# ==== Model weights - large binaries, never belong in git ====
+model_weights/
+apgcc_kit/weights/
+tmp_clipebc/checkpoints/
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+
+# ==== CLIP internals (weights/configs the clip submodule may cache) ====
+tmp_clipebc/models/clip/_clip/configs/*
+tmp_clipebc/models/clip/_clip/weights/*
+!tmp_clipebc/models/clip/_clip/configs/.gitkeep
+!tmp_clipebc/models/clip/_clip/weights/.gitkeep
+
+# ==== Data - test images, dataset caches, possibly licensed/sensitive ====
+data/images/
+tmp_clipebc/notebooks/counts/
+checkpoints/
+
+# ==== Results / logs ====
+results/
+tmp_clipebc/nwpu_test_results/
+apgcc_kit/weights/*/logs/
+*.log
+
+# ==== Secrets / env ====
+.env
+*.env
+secrets.json
+*.key
+*_key.txt
+
+# ==== Byte-compiled / Python cache ====
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# ==== Packaging / build ====
+build/
+dist/
+*.egg-info/
+.eggs/
+MANIFEST
+
+# ==== Test / coverage ====
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ==== Jupyter ====
+.ipynb_checkpoints/
+
+# ==== OS / editor junk ====
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
