@@ -1,0 +1,1 @@
+Drop your test images here (the ones you want to run all 3 model families on).

@@ -77,7 +77,7 @@ def preprocess(frame_bgr: np.ndarray, device: str,
 @torch.no_grad()
 def predict_points(model: nn.Module, frame_bgr: np.ndarray, device: str = "cuda",
                    conf: float = 0.5, max_long_side: int | None = 1280,
-                   fp16: bool = True) -> np.ndarray:
+                   fp16: bool = False) -> np.ndarray:
     """Return an (N, 3) float32 array of (x, y, score) in ORIGINAL frame pixels.
 
     Points landing in the zero-padded margin are dropped: the pad is black, the
@@ -96,6 +96,8 @@ def predict_points(model: nn.Module, frame_bgr: np.ndarray, device: str = "cuda"
 
     scores = torch.softmax(out["pred_logits"].float(), dim=-1)[0, :, 1].cpu().numpy()
     pts = out["pred_points"][0].float().cpu().numpy()
+    print(f"    [debug] raw scores: min={scores.min():.4f} max={scores.max():.4f} mean={scores.mean():.4f} n={len(scores)}")
+    print(f"    [debug] raw pts x=[{pts[:,0].min():.1f},{pts[:,0].max():.1f}] y=[{pts[:,1].min():.1f},{pts[:,1].max():.1f}]  valid_hw=({h},{w})")
 
     keep = (
         (scores > conf)
@@ -110,7 +112,7 @@ class ApgccPredictor:
     """Reusable predictor holding one model. Build once, call many times."""
 
     def __init__(self, weights=None, device: str = "cuda", conf: float = 0.5,
-                 max_long_side: int | None = 1280, fp16: bool = True,
+                 max_long_side: int | None = 1280, fp16: bool = False,
                  config: str = "shha"):
         from apgcc_loader import load_apgcc
         self.model, self.info = load_apgcc(weights, device=device, config=config)

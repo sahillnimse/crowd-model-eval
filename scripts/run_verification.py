@@ -245,7 +245,7 @@ def scale_points_to_frame(points: np.ndarray, map_hw: tuple, frame_hw: tuple) ->
 
 
 def draw_dot_panel(frame: np.ndarray, points: np.ndarray, count: float, label: str,
-                    dot_color=(0, 0, 255)) -> np.ndarray:
+                    dot_color=(0, 255, 0)) -> np.ndarray:
     """Draw small colored dots on detected/peak head locations, plus a title
     bar with the model name and its real total predicted count.
     """
@@ -421,18 +421,13 @@ def main():
             panel = draw_dot_panel(frame, points, count, label)
             panels.append((label, count, panel))
 
-            overlay_path = os.path.join(args.results_dir, f"{stem}_{key}_overlay.jpg")
-            cv2.imwrite(overlay_path, panel)
-
             print(f"  {label:16s} count={count:8.2f}"
-                  + (f"  points={n_points}" if n_points is not None else "  (dots are approximate peaks, not the count)")
-                  + f"  -> {os.path.basename(overlay_path)}")
+                  + (f"  points={n_points}" if n_points is not None else "  (dots are approximate peaks, not the count)"))
 
             rows.append({
                 "image": os.path.basename(img_path),
                 "model": label,
                 "predicted_count": round(count, 2),
-                "overlay_file": os.path.basename(overlay_path),
             })
 
         grid = build_comparison_grid(panels, os.path.basename(img_path))
